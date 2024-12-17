@@ -76,7 +76,7 @@ jobs:
       - name: Check uploads
         id: check
         run: |
-            URI="https://github.com/containers/podman/releases/download/${{steps.getversion.outputs.version}}"
+            URI="https://github.com/ppts-ai/podman/releases/download/${{steps.getversion.outputs.version}}"
             for artifact in "podman-remote-release-darwin_amd64.zip darwin_amd" \
                   'podman-remote-release-darwin_arm64.zip darwin_arm' \
                   'podman-remote-release-windows_amd64.zip windows_amd' \

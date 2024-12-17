@@ -64,7 +64,7 @@ jobs:
     - name: Check uploads
       id: check
       run: |
-        URI="https://github.com/containers/podman/releases/download/${{steps.getversion.outputs.version}}"
+        URI="https://github.com/ppts-ai/podman/releases/download/${{steps.getversion.outputs.version}}"
         ARM_FILE="podman-installer-macos-arm64.pkg"
         AMD_FILE="podman-installer-macos-amd64.pkg"
         UNIVERSAL_FILE="podman-installer-macos-universal.pkg"
