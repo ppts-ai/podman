@@ -245,15 +245,3 @@ jobs:
       - name: Provide release e-mail contents for examination
         run: cat email_body.txt
 
-      - name: Send release notification e-mail
-        # Ref: https://github.com/dawidd6/action-send-mail
-        uses: dawidd6/action-send-mail@v3.12.0
-        with:
-          server_address: ${{secrets.ACTION_MAIL_SERVER}}
-          server_port: 465
-          username: ${{secrets.ACTION_MAIL_USERNAME}}
-          password: ${{secrets.ACTION_MAIL_PASSWORD}}
-          subject: ${{ steps.format.outputs.mail_subj }}
-          to: Podman List <podman@lists.podman.io>
-          from: ${{secrets.ACTION_MAIL_SENDER}}
-          body: file://./email_body.txt
