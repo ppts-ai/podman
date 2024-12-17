@@ -112,7 +112,12 @@ func (c *Libp2pConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // createLibp2pHost creates a libp2p host
 func createLibp2pHost() (host.Host, error) {
-	return libp2p.New()
+	return libp2p.New(
+		libp2p.NoListenAddrs,
+		// Usually EnableRelay() is not required as it is enabled by default
+		// but NoListenAddrs overrides this, so we're adding it in explicitly again.
+		libp2p.EnableRelay(),
+	)
 }
 
 // connectToLibp2pPeer connects to a libp2p peer and opens a stream
@@ -347,7 +352,7 @@ func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connec
 	defer host.Close()
 
 	// Replace with your server's libp2p multiaddress
-	serverMultiAddr := "/ip4/127.0.0.1/tcp/4001/p2p/QmServerPeerID"
+	serverMultiAddr := "/ip4/64.176.227.5/tcp/4001/p2p/12D3KooWLzi9E1oaHLhWrgTPnPa3aUjNkM8vvC8nYZp1gk9RjTV1/p2p-circuit/p2p/" + uri
 
 	// Step 2: Connect to the libp2p peer
 	libp2pConn, err := connectToLibp2pPeer(ctx, host, serverMultiAddr)
@@ -356,10 +361,12 @@ func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connec
 	}
 
 	// Step 3: Create an SSH client
-	privateKey := []byte(`your-private-key`)
-	username := "your-username"
+	key, err := os.ReadFile(identity)
+	if err != nil {
+		return connection, err
+	}
 
-	conn, err := createSSHClient(libp2pConn, username, privateKey)
+	conn, err := createSSHClient(libp2pConn, userinfo.Username(), key)
 	if err != nil {
 		log.Fatalf("Failed to create SSH client: %v", err)
 	}
