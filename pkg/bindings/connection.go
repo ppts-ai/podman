@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,7 +22,14 @@ import (
 	"github.com/containers/podman/v5/version"
 	"github.com/kevinburke/ssh_config"
 	"github.com/sirupsen/logrus"
+	ssh2 "golang.org/x/crypto/ssh"
 	"golang.org/x/net/proxy"
+
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 )
 
 type APIResponse struct {
@@ -55,6 +63,103 @@ func (c ConnectError) Unwrap() error {
 
 func newConnectError(err error) error {
 	return ConnectError{Err: err}
+}
+
+const protocolID = "/libp2p/ssh-proxy/1.0.0"
+
+type MultiaddrAsNetAddr struct {
+	maddr multiaddr.Multiaddr
+}
+
+// Network returns a fixed string identifying the network.
+func (m MultiaddrAsNetAddr) Network() string {
+	return "libp2p"
+}
+
+// String returns the string representation of the multiaddr.
+func (m MultiaddrAsNetAddr) String() string {
+	return m.maddr.String()
+}
+
+// Libp2pConn wraps a libp2p stream to implement net.Conn
+type Libp2pConn struct {
+	stream network.Stream
+}
+
+func (c *Libp2pConn) Read(b []byte) (int, error) {
+	return c.stream.Read(b)
+}
+
+func (c *Libp2pConn) Write(b []byte) (int, error) {
+	return c.stream.Write(b)
+}
+
+func (c *Libp2pConn) Close() error {
+	return c.stream.Close()
+}
+
+func (c *Libp2pConn) LocalAddr() net.Addr {
+	return MultiaddrAsNetAddr{maddr: c.stream.Conn().LocalMultiaddr()}
+}
+
+func (c *Libp2pConn) RemoteAddr() net.Addr {
+	return MultiaddrAsNetAddr{maddr: c.stream.Conn().RemoteMultiaddr()}
+}
+
+func (c *Libp2pConn) SetDeadline(t time.Time) error      { return nil }
+func (c *Libp2pConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *Libp2pConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// createLibp2pHost creates a libp2p host
+func createLibp2pHost() (host.Host, error) {
+	return libp2p.New()
+}
+
+// connectToLibp2pPeer connects to a libp2p peer and opens a stream
+func connectToLibp2pPeer(ctx context.Context, h host.Host, peerAddr string) (*Libp2pConn, error) {
+	addr, err := multiaddr.NewMultiaddr(peerAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid multiaddr: %v", err)
+	}
+
+	peerInfo, err := peer.AddrInfoFromP2pAddr(addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse peer info: %v", err)
+	}
+
+	if err := h.Connect(ctx, *peerInfo); err != nil {
+		return nil, fmt.Errorf("failed to connect to peer: %v", err)
+	}
+
+	stream, err := h.NewStream(ctx, peerInfo.ID, protocolID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open stream: %v", err)
+	}
+
+	return &Libp2pConn{stream: stream}, nil
+}
+
+// createSSHClient creates an SSH client using the libp2p connection
+func createSSHClient(libp2pConn net.Conn, username string, privateKey []byte) (*ssh2.Client, error) {
+	signer, err := ssh2.ParsePrivateKey(privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %v", err)
+	}
+
+	clientConfig := &ssh2.ClientConfig{
+		User: username,
+		Auth: []ssh2.AuthMethod{
+			ssh2.PublicKeys(signer),
+		},
+		HostKeyCallback: ssh2.InsecureIgnoreHostKey(),
+	}
+
+	clientConn, chans, reqs, err := ssh2.NewClientConn(libp2pConn, "", clientConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSH client connection: %v", err)
+	}
+
+	return ssh2.NewClient(clientConn, chans, reqs), nil
 }
 
 // GetClient from context build by NewConnection()
@@ -230,13 +335,35 @@ func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connec
 			logrus.Debugf("  IdentityFile: %q", identity)
 		}
 	}
-	conn, err := ssh.Dial(&ssh.ConnectionDialOptions{
-		Host:                        uri,
-		Identity:                    identity,
-		User:                        userinfo,
-		Port:                        port,
-		InsecureIsMachineConnection: machine,
-	}, ssh.GolangMode)
+
+	// use libp2p connect as underlying network stream
+	ctx := context.Background()
+
+	// Step 1: Create the libp2p host
+	host, err := createLibp2pHost()
+	if err != nil {
+		log.Fatalf("Failed to create libp2p host: %v", err)
+	}
+	defer host.Close()
+
+	// Replace with your server's libp2p multiaddress
+	serverMultiAddr := "/ip4/127.0.0.1/tcp/4001/p2p/QmServerPeerID"
+
+	// Step 2: Connect to the libp2p peer
+	libp2pConn, err := connectToLibp2pPeer(ctx, host, serverMultiAddr)
+	if err != nil {
+		log.Fatalf("Failed to connect to libp2p peer: %v", err)
+	}
+
+	// Step 3: Create an SSH client
+	privateKey := []byte(`your-private-key`)
+	username := "your-username"
+
+	conn, err := createSSHClient(libp2pConn, username, privateKey)
+	if err != nil {
+		log.Fatalf("Failed to create SSH client: %v", err)
+	}
+	defer conn.Close()
 	if err != nil {
 		return connection, newConnectError(err)
 	}
