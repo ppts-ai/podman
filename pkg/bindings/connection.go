@@ -258,8 +258,9 @@ func NewConnectionWithIdentity(ctx context.Context, uri string, identity string,
 
 func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connection, error) {
 	var (
-		err  error
-		port int
+		err   error
+		port  int
+		alias string
 	)
 	connection := Connection{
 		URI: _url,
@@ -273,11 +274,11 @@ func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connec
 		}
 	}
 
+	alias = _url.Hostname()
 	// only parse ssh_config when we are not connecting to a machine
 	// For machine connections we always have the full URL in the
 	// system connection so reading the file is just unnecessary.
 	if !machine {
-		alias := _url.Hostname()
 		cfg := ssh_config.DefaultUserSettings
 		cfg.IgnoreErrors = true
 		found := false
@@ -352,7 +353,7 @@ func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connec
 	defer host.Close()
 
 	// Replace with your server's libp2p multiaddress
-	serverMultiAddr := "/ip4/64.176.227.5/tcp/4001/p2p/12D3KooWLzi9E1oaHLhWrgTPnPa3aUjNkM8vvC8nYZp1gk9RjTV1/p2p-circuit/p2p/" + uri
+	serverMultiAddr := "/ip4/64.176.227.5/tcp/4001/p2p/12D3KooWLzi9E1oaHLhWrgTPnPa3aUjNkM8vvC8nYZp1gk9RjTV1/p2p-circuit/p2p/" + alias
 
 	// Step 2: Connect to the libp2p peer
 	libp2pConn, err := connectToLibp2pPeer(ctx, host, serverMultiAddr)
