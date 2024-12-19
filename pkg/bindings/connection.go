@@ -29,7 +29,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/multiformats/go-multiaddr"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 type APIResponse struct {
@@ -65,7 +68,8 @@ func newConnectError(err error) error {
 	return ConnectError{Err: err}
 }
 
-const protocolID = "/libp2p/ssh-proxy/1.0.0"
+const protocolID = "/p2pdao/libp2p-ssh/1.0.0"
+const serviceName = "p2pdao.libp2p-proxy"
 
 type MultiaddrAsNetAddr struct {
 	maddr multiaddr.Multiaddr
@@ -114,6 +118,7 @@ func (c *Libp2pConn) SetWriteDeadline(t time.Time) error { return nil }
 func createLibp2pHost() (host.Host, error) {
 	return libp2p.New(
 		libp2p.NoListenAddrs,
+		libp2p.UserAgent(serviceName),
 		// Usually EnableRelay() is not required as it is enabled by default
 		// but NoListenAddrs overrides this, so we're adding it in explicitly again.
 		libp2p.EnableRelay(),
@@ -121,22 +126,98 @@ func createLibp2pHost() (host.Host, error) {
 }
 
 // connectToLibp2pPeer connects to a libp2p peer and opens a stream
-func connectToLibp2pPeer(ctx context.Context, h host.Host, peerAddr string) (*Libp2pConn, error) {
-	addr, err := multiaddr.NewMultiaddr(peerAddr)
+func connectToLibp2pPeer(ctx context.Context, host host.Host, relayAddress string, peerStr string) (*Libp2pConn, error) {
+
+	// The multiaddress string
+	multiAddrStr := "/ip4/64.176.227.5/tcp/4001/p2p/12D3KooWLzi9E1oaHLhWrgTPnPa3aUjNkM8vvC8nYZp1gk9RjTV1"
+
+	// Parse the multiaddress
+	multiAddr, err := multiaddr.NewMultiaddr(multiAddrStr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid multiaddr: %v", err)
+		log.Fatalf("Failed to parse multiaddress: %v", err)
 	}
 
-	peerInfo, err := peer.AddrInfoFromP2pAddr(addr)
+	// Extract AddrInfo from the multiaddress
+	relay1info, err := peer.AddrInfoFromP2pAddr(multiAddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse peer info: %v", err)
+		log.Fatalf("Failed to extract AddrInfo: %v", err)
 	}
 
-	if err := h.Connect(ctx, *peerInfo); err != nil {
-		return nil, fmt.Errorf("failed to connect to peer: %v", err)
+	serverPeer1, err := peer.AddrInfoFromString("/ip4/64.176.227.5/tcp/11212/ws/p2p/12D3KooWJJqoWuC2CVAuUfEfdLHguh1bPbKsLwQY4SoC2Vw695ry")
+	if err != nil {
+		fmt.Println(err)
 	}
 
-	stream, err := h.NewStream(ctx, peerInfo.ID, protocolID)
+	// Register a connection notification handler
+	host.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(n network.Network, conn network.Conn) {
+			addr := conn.RemoteMultiaddr()
+
+			if addr.String() == "" {
+				fmt.Println("No multiaddr found for connection.")
+				return
+			}
+
+			// Check if the connection is using a relay
+
+			fmt.Printf("Connected via relay: %s\n", addr)
+
+		},
+		DisconnectedF: func(_ network.Network, conn network.Conn) {
+			if conn.RemotePeer() == relay1info.ID {
+				fmt.Println("Lost connection to relay. Reconnecting...")
+			}
+		},
+	})
+
+	// Connect both unreachable1 and unreachable2 to relay1
+	if err := host.Connect(context.Background(), *relay1info); err != nil {
+		log.Printf("Failed to connect unreachable1 and relay1: %v", err)
+	}
+
+	fmt.Printf("Peer ID: %s\n", host.ID())
+
+	// Now create a new address for unreachable2 that specifies to communicate via
+	// relay1 using a circuit relay
+	serverPeer, err := ma.NewMultiaddr("/p2p/" + relay1info.ID.String() + "/p2p-circuit/p2p/" + serverPeer1.ID.String())
+	if err != nil {
+		log.Println(err)
+	} else {
+		log.Println(serverPeer)
+	}
+
+	// Since we just tried and failed to dial, the dialer system will, by default
+	// prevent us from redialing again so quickly. Since we know what we're doing, we
+	// can use this ugly hack (it's on our TODO list to make it a little cleaner)
+	// to tell the dialer "no, its okay, let's try this again"
+	host.Network().(*swarm.Swarm).Backoff().Clear(serverPeer1.ID)
+
+	log.Println("Now let's attempt to connect the hosts via the relay node")
+
+	// Open a connection to the previously unreachable host via the relay address
+	unreachable2relayinfo := peer.AddrInfo{
+		ID:    serverPeer1.ID,
+		Addrs: []ma.Multiaddr{serverPeer},
+	}
+	// host.Peerstore().AddAddrs(serverPeer.ID, serverPeer.Addrs, peerstore.PermanentAddrTTL)
+	ctxt, cancel := context.WithTimeout(ctx, time.Second*15)
+
+	if err := host.Connect(context.Background(), unreachable2relayinfo); err != nil {
+		log.Printf("Unexpected error here. Failed to connect unreachable1 and unreachable2: %v", err)
+	}
+
+	log.Println("Yep, that worked!")
+
+	res := <-ping.Ping(ctxt, host, serverPeer1.ID)
+	if res.Error != nil {
+		log.Fatalf("ping error: %v", res.Error)
+	} else {
+		log.Printf("ping RTT: %s", res.RTT)
+	}
+	cancel()
+	host.ConnManager().Protect(serverPeer1.ID, "proxy")
+
+	stream, err := host.NewStream(network.WithAllowLimitedConn(ctx, protocolID), serverPeer1.ID, protocolID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open stream: %v", err)
 	}
@@ -159,7 +240,7 @@ func createSSHClient(libp2pConn net.Conn, username string, privateKey []byte) (*
 		HostKeyCallback: ssh2.InsecureIgnoreHostKey(),
 	}
 
-	clientConn, chans, reqs, err := ssh2.NewClientConn(libp2pConn, "", clientConfig)
+	clientConn, chans, reqs, err := ssh2.NewClientConn(libp2pConn, "ssh://root@127.0.0.1:56503/run/podman/podman.sock", clientConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SSH client connection: %v", err)
 	}
@@ -227,6 +308,12 @@ func NewConnectionWithIdentity(ctx context.Context, uri string, identity string,
 			return nil, err
 		}
 		connection = conn
+	case "p2p":
+		conn, err := p2pClient(_url, uri, identity, machine)
+		if err != nil {
+			return nil, err
+		}
+		connection = conn
 	case "unix":
 		if !strings.HasPrefix(uri, "unix:///") {
 			// autofix unix://path_element vs unix:///path_element
@@ -256,7 +343,7 @@ func NewConnectionWithIdentity(ctx context.Context, uri string, identity string,
 	return ctx, nil
 }
 
-func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connection, error) {
+func p2pClient(_url *url.URL, uri string, identity string, machine bool) (Connection, error) {
 	var (
 		err   error
 		port  int
@@ -353,10 +440,10 @@ func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connec
 	defer host.Close()
 
 	// Replace with your server's libp2p multiaddress
-	serverMultiAddr := "/ip4/64.176.227.5/tcp/4001/p2p/12D3KooWLzi9E1oaHLhWrgTPnPa3aUjNkM8vvC8nYZp1gk9RjTV1/p2p-circuit/p2p/" + alias
+	serverMultiAddr := "/ip4/64.176.227.5/tcp/4001/p2p/12D3KooWLzi9E1oaHLhWrgTPnPa3aUjNkM8vvC8nYZp1gk9RjTV1"
 
 	// Step 2: Connect to the libp2p peer
-	libp2pConn, err := connectToLibp2pPeer(ctx, host, serverMultiAddr)
+	libp2pConn, err := connectToLibp2pPeer(ctx, host, serverMultiAddr, _url.Hostname())
 	if err != nil {
 		log.Fatalf("Failed to connect to libp2p peer: %v", err)
 	}
@@ -367,11 +454,131 @@ func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connec
 		return connection, err
 	}
 
-	conn, err := createSSHClient(libp2pConn, userinfo.Username(), key)
+	conn, err := createSSHClient(libp2pConn, "core", key)
 	if err != nil {
 		log.Fatalf("Failed to create SSH client: %v", err)
 	}
 	defer conn.Close()
+	if err != nil {
+		return connection, newConnectError(err)
+	}
+	if _url.Path == "" {
+		session, err := conn.NewSession()
+		if err != nil {
+			return connection, err
+		}
+		defer session.Close()
+
+		var b bytes.Buffer
+		session.Stdout = &b
+		if err := session.Run(
+			"podman info --format '{{.Host.RemoteSocket.Path}}'"); err != nil {
+			return connection, err
+		}
+		val := strings.TrimSuffix(b.String(), "\n")
+		_url.Path = val
+	}
+	dialContext := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return ssh.DialNet(conn, "unix", _url)
+	}
+	connection.Client = &http.Client{
+		Transport: &http.Transport{
+			DialContext: dialContext,
+		}}
+	return connection, nil
+}
+
+func sshClient(_url *url.URL, uri string, identity string, machine bool) (Connection, error) {
+	var (
+		err  error
+		port int
+	)
+	connection := Connection{
+		URI: _url,
+	}
+	userinfo := _url.User
+
+	if _url.Port() != "" {
+		port, err = strconv.Atoi(_url.Port())
+		if err != nil {
+			return connection, err
+		}
+	}
+
+	// only parse ssh_config when we are not connecting to a machine
+	// For machine connections we always have the full URL in the
+	// system connection so reading the file is just unnecessary.
+	if !machine {
+		alias := _url.Hostname()
+		cfg := ssh_config.DefaultUserSettings
+		cfg.IgnoreErrors = true
+		found := false
+
+		if userinfo == nil {
+			if val := cfg.Get(alias, "User"); val != "" {
+				userinfo = url.User(val)
+				found = true
+			}
+		}
+		// not in url or ssh_config so default to current user
+		if userinfo == nil {
+			u, err := user.Current()
+			if err != nil {
+				return connection, fmt.Errorf("current user could not be determined: %w", err)
+			}
+			userinfo = url.User(u.Username)
+		}
+
+		if val := cfg.Get(alias, "Hostname"); val != "" {
+			uri = val
+			found = true
+		}
+
+		if port == 0 {
+			if val := cfg.Get(alias, "Port"); val != "" {
+				if val != ssh_config.Default("Port") {
+					port, err = strconv.Atoi(val)
+					if err != nil {
+						return connection, fmt.Errorf("port is not an int: %s: %w", val, err)
+					}
+					found = true
+				}
+			}
+		}
+		// not in ssh config or url so use default 22 port
+		if port == 0 {
+			port = 22
+		}
+
+		if identity == "" {
+			if val := cfg.Get(alias, "IdentityFile"); val != "" {
+				identity = strings.Trim(val, "\"")
+				if strings.HasPrefix(identity, "~/") {
+					homedir, err := os.UserHomeDir()
+					if err != nil {
+						return connection, fmt.Errorf("failed to find home dir: %w", err)
+					}
+					identity = filepath.Join(homedir, identity[2:])
+				}
+				found = true
+			}
+		}
+
+		if found {
+			logrus.Debugf("ssh_config alias found: %s", alias)
+			logrus.Debugf("  User: %s", userinfo.Username())
+			logrus.Debugf("  Hostname: %s", uri)
+			logrus.Debugf("  Port: %d", port)
+			logrus.Debugf("  IdentityFile: %q", identity)
+		}
+	}
+	conn, err := ssh.Dial(&ssh.ConnectionDialOptions{
+		Host:                        uri,
+		Identity:                    identity,
+		User:                        userinfo,
+		Port:                        port,
+		InsecureIsMachineConnection: machine,
+	}, ssh.GolangMode)
 	if err != nil {
 		return connection, newConnectError(err)
 	}

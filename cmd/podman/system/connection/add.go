@@ -172,6 +172,8 @@ func add(cmd *cobra.Command, args []string) error {
 		if uri.Port() == "" {
 			return errors.New("tcp scheme requires a port either via --port or in destination URL")
 		}
+	case "p2p":
+		logrus.Infof("%q p2p scheme, no validation provided", uri.Scheme)
 	default:
 		logrus.Warnf("%q unknown scheme, no validation provided", uri.Scheme)
 	}
